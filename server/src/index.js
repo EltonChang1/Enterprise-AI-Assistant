@@ -3,6 +3,14 @@ import dotenv from 'dotenv';
 import express from 'express';
 import multer from 'multer';
 import OpenAI from 'openai';
+import {
+  createDatabase,
+  findUserByToken,
+  getOrgChunks,
+  getOrgKnowledgeSummary,
+  insertChatLog,
+  insertDocumentWithChunks
+} from './db.js';
 
 dotenv.config();
 
@@ -12,10 +20,9 @@ const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const embeddingModel = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const apiKey = process.env.OPENAI_API_KEY;
 
+const db = createDatabase();
 const openai = apiKey ? new OpenAI({ apiKey }) : null;
 const upload = multer({ storage: multer.memoryStorage() });
-const knowledgeChunks = [];
-let nextChunkId = 1;
 
 app.use(cors());
 app.use(express.json());
@@ -92,47 +99,99 @@ async function createEmbedding(text) {
   return response.data?.[0]?.embedding || null;
 }
 
-async function retrieveContext(query, topK = 4) {
-  if (!knowledgeChunks.length) return [];
+function extractToken(req) {
+  const bearer = req.headers.authorization;
+  if (bearer && bearer.toLowerCase().startsWith('bearer ')) {
+    return bearer.slice(7).trim();
+  }
+  return req.headers['x-api-token'];
+}
 
-  if (openai) {
-    const queryEmbedding = await createEmbedding(query);
-    if (!queryEmbedding) return [];
-    return knowledgeChunks
-      .map((chunk) => ({
-        ...chunk,
-        score: cosineSimilarity(queryEmbedding, chunk.embedding)
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+function authenticate(req, res, next) {
+  const token = extractToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'missing authentication token' });
   }
 
-  return knowledgeChunks
-    .map((chunk) => ({
-      ...chunk,
-      score: lexicalSimilarity(query, chunk.text)
-    }))
+  const user = findUserByToken(db, token);
+  if (!user) {
+    return res.status(401).json({ error: 'invalid authentication token' });
+  }
+
+  req.auth = user;
+  return next();
+}
+
+function requireRoles(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.auth) {
+      return res.status(401).json({ error: 'not authenticated' });
+    }
+    if (!allowedRoles.includes(req.auth.role)) {
+      return res.status(403).json({ error: 'insufficient role permissions' });
+    }
+    return next();
+  };
+}
+
+async function retrieveContextForOrg(orgId, query, topK = 4) {
+  const rawChunks = getOrgChunks(db, orgId);
+  if (!rawChunks.length) return [];
+
+  const chunks = rawChunks.map((chunk) => ({
+    ...chunk,
+    embedding: chunk.embeddingJson ? JSON.parse(chunk.embeddingJson) : null
+  }));
+
+  const queryEmbedding = openai ? await createEmbedding(query) : null;
+
+  return chunks
+    .map((chunk) => {
+      const lexical = lexicalSimilarity(query, chunk.text);
+      const semantic = queryEmbedding && chunk.embedding ? cosineSimilarity(queryEmbedding, chunk.embedding) : 0;
+      const score = semantic > 0 ? semantic * 0.8 + lexical * 0.2 : lexical;
+      return {
+        ...chunk,
+        score
+      };
+    })
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
 }
 
 app.get('/api/health', (_req, res) => {
+  const orgSummary = db.prepare('SELECT COUNT(*) as count FROM organizations').get();
+  const userSummary = db.prepare('SELECT COUNT(*) as count FROM users').get();
+
   res.json({
     status: 'ok',
     service: 'enterprise-ai-assistant-server',
-    phase: 2,
-    chunksIndexed: knowledgeChunks.length
+    phase: 3,
+    organizations: orgSummary.count,
+    users: userSummary.count
   });
 });
 
-app.get('/api/knowledge', (_req, res) => {
+app.get('/api/me', authenticate, (req, res) => {
   res.json({
-    chunksIndexed: knowledgeChunks.length,
-    sources: [...new Set(knowledgeChunks.map((chunk) => chunk.source))]
+    user: {
+      id: req.auth.id,
+      name: req.auth.name,
+      email: req.auth.email,
+      role: req.auth.role,
+      orgId: req.auth.orgId,
+      orgName: req.auth.orgName,
+      orgSlug: req.auth.orgSlug
+    }
   });
 });
 
-app.post('/api/knowledge/upload', upload.single('document'), async (req, res) => {
+app.get('/api/knowledge', authenticate, (req, res) => {
+  const summary = getOrgKnowledgeSummary(db, req.auth.orgId);
+  res.json(summary);
+});
+
+app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), upload.single('document'), async (req, res) => {
   const file = req.file;
   if (!file) {
     return res.status(400).json({ error: 'document file is required' });
@@ -146,26 +205,31 @@ app.post('/api/knowledge/upload', upload.single('document'), async (req, res) =>
       return res.status(400).json({ error: 'uploaded document had no readable text' });
     }
 
-    const created = [];
+    const preparedChunks = [];
     for (const chunkText of chunks) {
       const embedding = await createEmbedding(chunkText);
-      created.push({
-        id: nextChunkId,
-        source: file.originalname,
+      preparedChunks.push({
         text: chunkText,
-        embedding
+        embeddingJson: embedding ? JSON.stringify(embedding) : null
       });
-      nextChunkId += 1;
     }
 
-    knowledgeChunks.push(...created);
+    insertDocumentWithChunks(db, {
+      orgId: req.auth.orgId,
+      source: file.originalname,
+      userId: req.auth.id,
+      chunks: preparedChunks
+    });
+
+    const summary = getOrgKnowledgeSummary(db, req.auth.orgId);
 
     return res.json({
       message: 'document indexed',
       source: file.originalname,
-      chunksAdded: created.length,
-      chunksIndexed: knowledgeChunks.length,
-      mode: openai ? 'embedding' : 'lexical-fallback'
+      chunksAdded: preparedChunks.length,
+      chunksIndexed: summary.chunksIndexed,
+      mode: openai ? 'embedding' : 'lexical-fallback',
+      org: req.auth.orgSlug
     });
   } catch (error) {
     return res.status(500).json({
@@ -175,21 +239,33 @@ app.post('/api/knowledge/upload', upload.single('document'), async (req, res) =>
   }
 });
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', authenticate, async (req, res) => {
   const { messages = [] } = req.body;
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'messages array is required' });
   }
 
+  const userLast = [...messages].reverse().find((m) => m.role === 'user');
+
   try {
     if (!openai) {
-      const userLast = [...messages].reverse().find((m) => m.role === 'user');
+      const responseText =
+        "OPENAI_API_KEY is not configured yet. This is a local fallback response. You said: " +
+        (userLast?.content || '');
+
+      insertChatLog(db, {
+        orgId: req.auth.orgId,
+        userId: req.auth.id,
+        mode: 'chat',
+        question: userLast?.content,
+        answer: responseText
+      });
+
       return res.json({
-        message:
-          "OPENAI_API_KEY is not configured yet. This is a local fallback response. You said: " +
-          (userLast?.content || ''),
-        provider: 'mock'
+        message: responseText,
+        provider: 'mock',
+        org: req.auth.orgSlug
       });
     }
 
@@ -199,7 +275,7 @@ app.post('/api/chat', async (req, res) => {
         {
           role: 'system',
           content:
-            'You are an enterprise AI assistant. Give concise, accurate, business-friendly answers and cite uncertainty clearly.'
+            `You are an enterprise AI assistant for ${req.auth.orgName}. Give concise, accurate, business-friendly answers and cite uncertainty clearly.`
         },
         ...messages
       ],
@@ -208,10 +284,19 @@ app.post('/api/chat', async (req, res) => {
 
     const answer = completion.choices?.[0]?.message?.content || 'No response returned.';
 
+    insertChatLog(db, {
+      orgId: req.auth.orgId,
+      userId: req.auth.id,
+      mode: 'chat',
+      question: userLast?.content,
+      answer
+    });
+
     return res.json({
       message: answer,
       provider: 'openai',
-      model
+      model,
+      org: req.auth.orgSlug
     });
   } catch (error) {
     return res.status(500).json({
@@ -221,7 +306,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-app.post('/api/chat/rag', async (req, res) => {
+app.post('/api/chat/rag', authenticate, async (req, res) => {
   const { messages = [], topK = 4 } = req.body;
 
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -232,7 +317,7 @@ app.post('/api/chat/rag', async (req, res) => {
   const query = userLast?.content || '';
 
   try {
-    const contextChunks = await retrieveContext(query, topK);
+    const contextChunks = await retrieveContextForOrg(req.auth.orgId, query, topK);
     const contextText = contextChunks
       .map(
         (chunk, index) =>
@@ -241,12 +326,23 @@ app.post('/api/chat/rag', async (req, res) => {
       .join('\n\n');
 
     if (!openai) {
+      const responseText =
+        `RAG fallback mode active for org ${req.auth.orgSlug}. I found ${contextChunks.length} matching chunks. ` +
+        `Top source: ${contextChunks[0]?.source || 'none'}. ` +
+        `Your question: ${query}`;
+
+      insertChatLog(db, {
+        orgId: req.auth.orgId,
+        userId: req.auth.id,
+        mode: 'rag',
+        question: query,
+        answer: responseText
+      });
+
       return res.json({
-        message:
-          `RAG fallback mode active. I found ${contextChunks.length} matching chunks. ` +
-          `Top source: ${contextChunks[0]?.source || 'none'}. ` +
-          `Your question: ${query}`,
+        message: responseText,
         provider: 'mock-rag',
+        org: req.auth.orgSlug,
         contextUsed: contextChunks.map((c) => ({ source: c.source, score: Number(c.score.toFixed(4)) }))
       });
     }
@@ -258,7 +354,7 @@ app.post('/api/chat/rag', async (req, res) => {
         {
           role: 'system',
           content:
-            'You are an enterprise assistant. Answer using the provided context first. If context is insufficient, explicitly say what is missing.'
+            `You are an enterprise assistant for ${req.auth.orgName}. Answer using the provided context first. If context is insufficient, explicitly say what is missing.`
         },
         {
           role: 'system',
@@ -270,10 +366,19 @@ app.post('/api/chat/rag', async (req, res) => {
 
     const answer = completion.choices?.[0]?.message?.content || 'No response returned.';
 
+    insertChatLog(db, {
+      orgId: req.auth.orgId,
+      userId: req.auth.id,
+      mode: 'rag',
+      question: query,
+      answer
+    });
+
     return res.json({
       message: answer,
       provider: 'openai-rag',
       model,
+      org: req.auth.orgSlug,
       contextUsed: contextChunks.map((c) => ({ source: c.source, score: Number(c.score.toFixed(4)) }))
     });
   } catch (error) {
@@ -286,4 +391,5 @@ app.post('/api/chat/rag', async (req, res) => {
 
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
+  console.log('Seed tokens: acme-admin-token, acme-user-token, acme-viewer-token');
 });

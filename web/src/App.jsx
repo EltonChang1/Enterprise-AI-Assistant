@@ -6,9 +6,12 @@ export default function App() {
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
-      content: 'Welcome to Enterprise AI Assistant Phase 1. Ask me anything related to your business workflows.'
+      content:
+        'Welcome to Enterprise AI Assistant Phase 3. Authenticate with a tenant token, then chat or use RAG.'
     }
   ]);
+  const [token, setToken] = useState('acme-admin-token');
+  const [identity, setIdentity] = useState(null);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -22,10 +25,34 @@ export default function App() {
     [messages]
   );
 
+  const authHeaders = () => ({
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token.trim()}`
+  });
+
+  const connectIdentity = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/me`, {
+        headers: { Authorization: `Bearer ${token.trim()}` }
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Authentication failed');
+      setIdentity(data.user);
+      setUploadStatus(`Authenticated as ${data.user.name} (${data.user.role}) in ${data.user.orgSlug}.`);
+    } catch (error) {
+      setIdentity(null);
+      setUploadStatus(`Auth error: ${error.message}`);
+    }
+  };
+
   const sendMessage = async (e) => {
     e.preventDefault();
     const text = input.trim();
     if (!text || loading) return;
+    if (!identity) {
+      setUploadStatus('Authenticate first using a valid token.');
+      return;
+    }
 
     const userMessage = { role: 'user', content: text };
     const nextMessages = [...messages, userMessage];
@@ -37,7 +64,7 @@ export default function App() {
       const endpoint = ragMode ? '/api/chat/rag' : '/api/chat';
       const res = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ messages: nextMessages })
       });
 
@@ -45,7 +72,6 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Request failed');
 
       setContextUsed(data.contextUsed || []);
-
       setMessages((prev) => [
         ...prev,
         { role: 'assistant', content: data.message || 'No response generated.' }
@@ -68,6 +94,11 @@ export default function App() {
   const uploadDocument = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    if (!identity) {
+      setUploadStatus('Authenticate first using a valid token.');
+      event.target.value = '';
+      return;
+    }
 
     setUploading(true);
     setUploadStatus(`Uploading ${file.name}...`);
@@ -78,6 +109,9 @@ export default function App() {
 
       const res = await fetch(`${API_BASE}/api/knowledge/upload`, {
         method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token.trim()}`
+        },
         body: formData
       });
 
@@ -85,7 +119,7 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Upload failed');
 
       setUploadStatus(
-        `Indexed ${data.source} (${data.chunksAdded} chunks). Total indexed: ${data.chunksIndexed}.`
+        `Indexed ${data.source} (${data.chunksAdded} chunks). Total indexed: ${data.chunksIndexed}. Org: ${data.org}.`
       );
     } catch (error) {
       setUploadStatus(`Upload error: ${error.message}`);
@@ -98,7 +132,26 @@ export default function App() {
   return (
     <main className="app">
       <h1>Enterprise AI Assistant</h1>
-      <div className="subtitle">Phase 2: Document Upload + RAG Chat</div>
+      <div className="subtitle">Phase 3: Multi-Tenant Auth + RBAC + Persistent Storage</div>
+
+      <section className="panel">
+        <div className="panel-row">
+          <label className="upload-label auth-field">
+            <span>API Token</span>
+            <input
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="Enter tenant token"
+            />
+          </label>
+          <button type="button" onClick={connectIdentity}>Authenticate</button>
+        </div>
+        <div className="status">
+          {identity
+            ? `Connected: ${identity.name} (${identity.role}) @ ${identity.orgSlug}`
+            : 'Not authenticated'}
+        </div>
+      </section>
 
       <section className="panel">
         <div className="panel-row">

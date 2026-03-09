@@ -1,4 +1,4 @@
-# Enterprise AI Assistant (Phases 1-2)
+# Enterprise AI Assistant (Phases 1-3)
 
 Phase 1 goal: ship a working enterprise assistant baseline with:
 - React chat UI
@@ -11,6 +11,12 @@ Phase 2 additions:
 - Chunk indexing for uploaded files
 - Retrieval-Augmented Generation (RAG) chat mode
 - Context trace display in UI
+
+Phase 3 additions:
+- Multi-tenant persistent storage with SQLite
+- Token-based authentication
+- Role-based access control (admin/user/viewer)
+- Organization-scoped knowledge retrieval and chat logs
 
 ## Project Structure
 
@@ -33,6 +39,7 @@ cp server/.env.example server/.env
 ```
 
 Then add `OPENAI_API_KEY` in `server/.env` if you want real model responses.
+`DB_PATH` defaults to `./data/enterprise_ai.db` and stores persistent tenant data.
 
 3. Start backend
 
@@ -51,10 +58,22 @@ Frontend runs on `http://localhost:5174` and calls backend at `http://localhost:
 ## API Endpoints
 
 - `GET /api/health`
-- `GET /api/knowledge`
-- `POST /api/knowledge/upload` (multipart form-data, field: `document`)
-- `POST /api/chat`
-- `POST /api/chat/rag`
+- `GET /api/me` (auth required)
+- `GET /api/knowledge` (auth required)
+- `POST /api/knowledge/upload` (auth required, roles: admin/user, multipart form-data field: `document`)
+- `POST /api/chat` (auth required)
+- `POST /api/chat/rag` (auth required)
+
+Use bearer token auth header:
+
+```bash
+Authorization: Bearer <token>
+```
+
+Seeded demo tokens:
+- `acme-admin-token`
+- `acme-user-token`
+- `acme-viewer-token`
 
 Request body for `/api/chat`:
 

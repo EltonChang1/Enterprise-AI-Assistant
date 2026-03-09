@@ -48,6 +48,11 @@ h1 {
   font-size: 0.92rem;
 }
 
+.auth-field {
+  flex: 1;
+  min-width: 320px;
+}
+
 .toggle {
   display: flex;
   align-items: center;
