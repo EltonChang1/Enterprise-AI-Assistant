@@ -1,10 +1,16 @@
-# Enterprise AI Assistant (Phase 1)
+# Enterprise AI Assistant (Phases 1-2)
 
 Phase 1 goal: ship a working enterprise assistant baseline with:
 - React chat UI
 - Express chat API
 - Optional OpenAI integration
 - Local fallback response when `OPENAI_API_KEY` is not set
+
+Phase 2 additions:
+- Document upload endpoint for knowledge ingestion
+- Chunk indexing for uploaded files
+- Retrieval-Augmented Generation (RAG) chat mode
+- Context trace display in UI
 
 ## Project Structure
 
@@ -45,7 +51,10 @@ Frontend runs on `http://localhost:5174` and calls backend at `http://localhost:
 ## API Endpoints
 
 - `GET /api/health`
+- `GET /api/knowledge`
+- `POST /api/knowledge/upload` (multipart form-data, field: `document`)
 - `POST /api/chat`
+- `POST /api/chat/rag`
 
 Request body for `/api/chat`:
 
@@ -54,5 +63,16 @@ Request body for `/api/chat`:
   "messages": [
     { "role": "user", "content": "How can I automate onboarding?" }
   ]
+}
+```
+
+Request body for `/api/chat/rag`:
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "Summarize our onboarding policy" }
+  ],
+  "topK": 4
 }
 ```

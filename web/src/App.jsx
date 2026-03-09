@@ -11,6 +11,10 @@ export default function App() {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [ragMode, setRagMode] = useState(true);
+  const [uploadStatus, setUploadStatus] = useState('No documents uploaded yet.');
+  const [contextUsed, setContextUsed] = useState([]);
   const chatRef = useRef(null);
 
   const conversation = useMemo(
@@ -30,7 +34,8 @@ export default function App() {
     setLoading(true);
 
     try {
-      const res = await fetch(`${API_BASE}/api/chat`, {
+      const endpoint = ragMode ? '/api/chat/rag' : '/api/chat';
+      const res = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: nextMessages })
@@ -38,6 +43,8 @@ export default function App() {
 
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Request failed');
+
+      setContextUsed(data.contextUsed || []);
 
       setMessages((prev) => [
         ...prev,
@@ -58,10 +65,63 @@ export default function App() {
     }
   };
 
+  const uploadDocument = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setUploading(true);
+    setUploadStatus(`Uploading ${file.name}...`);
+
+    try {
+      const formData = new FormData();
+      formData.append('document', file);
+
+      const res = await fetch(`${API_BASE}/api/knowledge/upload`, {
+        method: 'POST',
+        body: formData
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+      setUploadStatus(
+        `Indexed ${data.source} (${data.chunksAdded} chunks). Total indexed: ${data.chunksIndexed}.`
+      );
+    } catch (error) {
+      setUploadStatus(`Upload error: ${error.message}`);
+    } finally {
+      setUploading(false);
+      event.target.value = '';
+    }
+  };
+
   return (
     <main className="app">
       <h1>Enterprise AI Assistant</h1>
-      <div className="subtitle">Phase 1: Core Chat + API Integration</div>
+      <div className="subtitle">Phase 2: Document Upload + RAG Chat</div>
+
+      <section className="panel">
+        <div className="panel-row">
+          <label className="upload-label">
+            <span>{uploading ? 'Uploading...' : 'Upload Knowledge Document (.txt/.md/.json/.csv)'}</span>
+            <input type="file" onChange={uploadDocument} disabled={uploading} />
+          </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={ragMode}
+              onChange={(e) => setRagMode(e.target.checked)}
+            />
+            <span>RAG Mode</span>
+          </label>
+        </div>
+        <div className="status">{uploadStatus}</div>
+        {contextUsed.length > 0 && (
+          <div className="status">
+            Context used: {contextUsed.map((item) => `${item.source} (${item.score})`).join(', ')}
+          </div>
+        )}
+      </section>
 
       <section className="chatbox" ref={chatRef}>
         {conversation.map((msg, idx) => (
