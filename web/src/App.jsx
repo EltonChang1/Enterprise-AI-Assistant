@@ -1,13 +1,14 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const API_BASE = 'http://localhost:4000';
+const WS_BASE = 'ws://localhost:4000';
 
 export default function App() {
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
       content:
-        'Welcome to Enterprise AI Assistant Phase 3. Authenticate with a tenant token, then chat or use RAG.'
+        'Welcome to Enterprise AI Assistant Phase 4. Authenticate, then use chat/RAG/streaming/agent modes.'
     }
   ]);
   const [token, setToken] = useState('acme-admin-token');
@@ -16,9 +17,14 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [ragMode, setRagMode] = useState(true);
+  const [streamMode, setStreamMode] = useState(false);
+  const [agentMode, setAgentMode] = useState(false);
   const [uploadStatus, setUploadStatus] = useState('No documents uploaded yet.');
   const [contextUsed, setContextUsed] = useState([]);
+  const [analytics, setAnalytics] = useState(null);
+  const [showAnalytics, setShowAnalytics] = useState(false);
   const chatRef = useRef(null);
+  const wsRef = useRef(null);
 
   const conversation = useMemo(
     () => messages.filter((m) => m.role === 'user' || m.role === 'assistant'),
@@ -30,6 +36,70 @@ export default function App() {
     Authorization: `Bearer ${token.trim()}`
   });
 
+  const initWebSocket = () => {
+    if (wsRef.current) return;
+
+    const ws = new WebSocket(WS_BASE);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'auth', token: token.trim() }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (data.type === 'auth_success') {
+          setUploadStatus(`WebSocket authenticated as ${data.user.name} (${data.user.role})`);
+        } else if (data.type === 'chunk') {
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === 'assistant' && last?.streaming) {
+              return [
+                ...prev.slice(0, -1),
+                { role: 'assistant', content: last.content + data.content, streaming: true }
+              ];
+            }
+            return [...prev, { role: 'assistant', content: data.content, streaming: true }];
+          });
+        } else if (data.type === 'done') {
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.streaming) {
+              return [...prev.slice(0, -1), { role: 'assistant', content: last.content }];
+            }
+            return prev;
+          });
+          setLoading(false);
+        } else if (data.type === 'error') {
+          setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${data.message}` }]);
+          setLoading(false);
+        }
+      } catch (error) {
+        console.error('WebSocket message error:', error);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setLoading(false);
+    };
+
+    ws.onclose = () => {
+      wsRef.current = null;
+    };
+  };
+
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, []);
+
   const connectIdentity = async () => {
     try {
       const res = await fetch(`${API_BASE}/api/me`, {
@@ -39,9 +109,32 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Authentication failed');
       setIdentity(data.user);
       setUploadStatus(`Authenticated as ${data.user.name} (${data.user.role}) in ${data.user.orgSlug}.`);
+
+      if (streamMode) {
+        initWebSocket();
+      }
     } catch (error) {
       setIdentity(null);
       setUploadStatus(`Auth error: ${error.message}`);
+    }
+  };
+
+  const fetchAnalytics = async () => {
+    if (!identity || identity.role !== 'admin') {
+      setUploadStatus('Analytics requires admin role.');
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/analytics/overview`, {
+        headers: authHeaders()
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Analytics fetch failed');
+      setAnalytics(data);
+      setShowAnalytics(true);
+    } catch (error) {
+      setUploadStatus(`Analytics error: ${error.message}`);
     }
   };
 
@@ -61,28 +154,72 @@ export default function App() {
     setLoading(true);
 
     try {
-      const endpoint = ragMode ? '/api/chat/rag' : '/api/chat';
-      const res = await fetch(`${API_BASE}${endpoint}`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify({ messages: nextMessages })
-      });
+      if (streamMode) {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          initWebSocket();
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Request failed');
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'chat_stream',
+            messages: nextMessages,
+            mode: ragMode ? 'rag' : 'chat'
+          })
+        );
 
-      setContextUsed(data.contextUsed || []);
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: data.message || 'No response generated.' }
-      ]);
+        requestAnimationFrame(() => {
+          if (chatRef.current) {
+            chatRef.current.scrollTop = chatRef.current.scrollHeight;
+          }
+        });
+        return;
+      }
+
+      if (agentMode) {
+        const res = await fetch(`${API_BASE}/api/chat/agent`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ messages: nextMessages })
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+
+        let responseContent = data.message || 'No response generated.';
+        if (data.toolCalls && data.toolCalls.length > 0) {
+          responseContent +=
+            '\n\nTools used:\n' +
+            data.toolCalls.map((tc) => `- ${tc.tool}(${JSON.stringify(tc.arguments)})`).join('\n');
+        }
+
+        setMessages((prev) => [...prev, { role: 'assistant', content: responseContent }]);
+      } else {
+        const endpoint = ragMode ? '/api/chat/rag' : '/api/chat';
+        const res = await fetch(`${API_BASE}${endpoint}`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ messages: nextMessages })
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+
+        setContextUsed(data.contextUsed || []);
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: data.message || 'No response generated.' }
+        ]);
+      }
     } catch (error) {
       setMessages((prev) => [
         ...prev,
         { role: 'assistant', content: `Error: ${error.message}` }
       ]);
     } finally {
-      setLoading(false);
+      if (!streamMode) {
+        setLoading(false);
+      }
       requestAnimationFrame(() => {
         if (chatRef.current) {
           chatRef.current.scrollTop = chatRef.current.scrollHeight;
@@ -132,7 +269,7 @@ export default function App() {
   return (
     <main className="app">
       <h1>Enterprise AI Assistant</h1>
-      <div className="subtitle">Phase 3: Multi-Tenant Auth + RBAC + Persistent Storage</div>
+      <div className="subtitle">Phase 4: WebSocket Streaming + Agent Tools + Analytics</div>
 
       <section className="panel">
         <div className="panel-row">
@@ -144,7 +281,14 @@ export default function App() {
               placeholder="Enter tenant token"
             />
           </label>
-          <button type="button" onClick={connectIdentity}>Authenticate</button>
+          <button type="button" onClick={connectIdentity}>
+            Authenticate
+          </button>
+          {identity?.role === 'admin' && (
+            <button type="button" onClick={fetchAnalytics}>
+              {showAnalytics ? 'Hide Analytics' : 'Show Analytics'}
+            </button>
+          )}
         </div>
         <div className="status">
           {identity
@@ -152,6 +296,25 @@ export default function App() {
             : 'Not authenticated'}
         </div>
       </section>
+
+      {showAnalytics && analytics && (
+        <section className="panel">
+          <h3>Analytics Overview</h3>
+          <ul>
+            <li>Total Chats: {analytics.totalChats}</li>
+            <li>RAG Chats: {analytics.ragChats}</li>
+            <li>Regular Chats: {analytics.regularChats}</li>
+            <li>Total Documents: {analytics.totalDocuments}</li>
+            <li>Total Knowledge Chunks: {analytics.totalChunks}</li>
+            {analytics.recentActivity && analytics.recentActivity.length > 0 && (
+              <li>
+                Last 7 days:{' '}
+                {analytics.recentActivity.map((a) => `${a.mode}:${a.count}`).join(', ')}
+              </li>
+            )}
+          </ul>
+        </section>
+      )}
 
       <section className="panel">
         <div className="panel-row">
@@ -163,9 +326,34 @@ export default function App() {
             <input
               type="checkbox"
               checked={ragMode}
-              onChange={(e) => setRagMode(e.target.checked)}
+              onChange={(e) => {
+                setRagMode(e.target.checked);
+                if (e.target.checked && agentMode) setAgentMode(false);
+              }}
             />
-            <span>RAG Mode</span>
+            <span>RAG</span>
+          </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={streamMode}
+              onChange={(e) => {
+                setStreamMode(e.target.checked);
+                if (e.target.checked && !wsRef.current) initWebSocket();
+              }}
+            />
+            <span>Stream</span>
+          </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={agentMode}
+              onChange={(e) => {
+                setAgentMode(e.target.checked);
+                if (e.target.checked && ragMode) setRagMode(false);
+              }}
+            />
+            <span>Agent</span>
           </label>
         </div>
         <div className="status">{uploadStatus}</div>

@@ -1,4 +1,4 @@
-# Enterprise AI Assistant (Phases 1-3)
+# Enterprise AI Assistant (Phases 1-4)
 
 Phase 1 goal: ship a working enterprise assistant baseline with:
 - React chat UI
@@ -17,6 +17,12 @@ Phase 3 additions:
 - Token-based authentication
 - Role-based access control (admin/user/viewer)
 - Organization-scoped knowledge retrieval and chat logs
+
+Phase 4 additions:
+- WebSocket streaming for real-time token-by-token responses
+- Agent tools with function calling (search_knowledge, calculate, get_current_time)
+- Analytics dashboard for admins (chat logs, document stats, activity metrics)
+- Multi-mode chat interface (Regular/RAG/Streaming/Agent)
 
 ## Project Structure
 
@@ -63,6 +69,9 @@ Frontend runs on `http://localhost:5174` and calls backend at `http://localhost:
 - `POST /api/knowledge/upload` (auth required, roles: admin/user, multipart form-data field: `document`)
 - `POST /api/chat` (auth required)
 - `POST /api/chat/rag` (auth required)
+- `POST /api/chat/agent` (auth required, Phase 4 - agent with tools)
+- `GET /api/analytics/overview` (auth required, role: admin, Phase 4)
+- WebSocket at `ws://localhost:4000` (auth via JSON message, Phase 4)
 
 Use bearer token auth header:
 
@@ -93,5 +102,32 @@ Request body for `/api/chat/rag`:
     { "role": "user", "content": "Summarize our onboarding policy" }
   ],
   "topK": 4
+}
+```
+
+Request body for `/api/chat/agent`:
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "What time is it?" }
+  ]
+}
+```
+
+WebSocket message for streaming:
+
+```json
+{
+  "type": "auth",
+  "token": "acme-admin-token"
+}
+```
+
+```json
+{
+  "type": "chat_stream",
+  "messages": [{ "role": "user", "content": "Hello" }],
+  "mode": "chat"
 }
 ```

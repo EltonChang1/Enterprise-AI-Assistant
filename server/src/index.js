@@ -1,8 +1,11 @@
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
+import { createServer } from 'http';
 import multer from 'multer';
 import OpenAI from 'openai';
+import { WebSocketServer } from 'ws';
+import { agentTools, executeToolCall } from './agents.js';
 import {
   createDatabase,
   findUserByToken,
@@ -166,9 +169,10 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'enterprise-ai-assistant-server',
-    phase: 3,
+    phase: 4,
     organizations: orgSummary.count,
-    users: userSummary.count
+    users: userSummary.count,
+    features: ['auth', 'rag', 'websocket', 'agents', 'analytics']
   });
 });
 
@@ -389,7 +393,258 @@ app.post('/api/chat/rag', authenticate, async (req, res) => {
   }
 });
 
-app.listen(port, () => {
+// Analytics endpoints
+app.get('/api/analytics/overview', authenticate, requireRoles('admin'), (req, res) => {
+  const totalChats = db
+    .prepare('SELECT COUNT(*) as count FROM chat_logs WHERE org_id = ?')
+    .get(req.auth.orgId).count;
+
+  const totalDocs = db
+    .prepare('SELECT COUNT(*) as count FROM documents WHERE org_id = ?')
+    .get(req.auth.orgId).count;
+
+  const totalChunks = db
+    .prepare('SELECT COUNT(*) as count FROM knowledge_chunks WHERE org_id = ?')
+    .get(req.auth.orgId).count;
+
+  const ragChats = db
+    .prepare('SELECT COUNT(*) as count FROM chat_logs WHERE org_id = ? AND mode = ?')
+    .get(req.auth.orgId, 'rag').count;
+
+  const recentChats = db
+    .prepare(
+      `SELECT mode, COUNT(*) as count
+       FROM chat_logs
+       WHERE org_id = ? AND created_at > datetime('now', '-7 days')
+       GROUP BY mode`
+    )
+    .all(req.auth.orgId);
+
+  res.json({
+    totalChats,
+    totalDocuments: totalDocs,
+    totalChunks,
+    ragChats,
+    regularChats: totalChats - ragChats,
+    recentActivity: recentChats
+  });
+});
+
+// Agent chat with tool calling
+app.post('/api/chat/agent', authenticate, async (req, res) => {
+  const { messages = [] } = req.body;
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array is required' });
+  }
+
+  const userLast = [...messages].reverse().find((m) => m.role === 'user');
+
+  try {
+    if (!openai) {
+      return res.json({
+        message: 'Agent mode requires OPENAI_API_KEY configuration.',
+        provider: 'mock-agent',
+        toolCalls: []
+      });
+    }
+
+    const completion = await openai.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: 'system',
+          content:
+            `You are an intelligent agent for ${req.auth.orgName}. You can use tools to help answer questions. Be concise and professional.`
+        },
+        ...messages
+      ],
+      tools: agentTools,
+      temperature: 0.3
+    });
+
+    const responseMessage = completion.choices?.[0]?.message;
+    const toolCalls = responseMessage?.tool_calls || [];
+    const toolResults = [];
+
+    if (toolCalls.length > 0) {
+      for (const toolCall of toolCalls) {
+        const toolName = toolCall.function.name;
+        const toolArgs = JSON.parse(toolCall.function.arguments);
+        const result = await executeToolCall(toolName, toolArgs, {
+          db,
+          retrieveContextForOrg,
+          orgId: req.auth.orgId
+        });
+        toolResults.push({
+          tool: toolName,
+          arguments: toolArgs,
+          result
+        });
+      }
+
+      const secondCompletion = await openai.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              `You are an intelligent agent for ${req.auth.orgName}. You can use tools to help answer questions. Be concise and professional.`
+          },
+          ...messages,
+          responseMessage,
+          ...toolCalls.map((tc, idx) => ({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify(toolResults[idx].result)
+          }))
+        ],
+        temperature: 0.3
+      });
+
+      const finalAnswer = secondCompletion.choices?.[0]?.message?.content || 'No response.';
+
+      insertChatLog(db, {
+        orgId: req.auth.orgId,
+        userId: req.auth.id,
+        mode: 'agent',
+        question: userLast?.content,
+        answer: finalAnswer
+      });
+
+      return res.json({
+        message: finalAnswer,
+        provider: 'openai-agent',
+        model,
+        toolCalls: toolResults
+      });
+    }
+
+    const answer = responseMessage?.content || 'No response returned.';
+
+    insertChatLog(db, {
+      orgId: req.auth.orgId,
+      userId: req.auth.id,
+      mode: 'agent',
+      question: userLast?.content,
+      answer
+    });
+
+    return res.json({
+      message: answer,
+      provider: 'openai-agent',
+      model,
+      toolCalls: []
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: 'agent chat request failed',
+      details: error?.message || 'unknown error'
+    });
+  }
+});
+
+// HTTP server with WebSocket support
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  let authenticated = false;
+  let userAuth = null;
+
+  ws.on('message', async (rawMessage) => {
+    try {
+      const data = JSON.parse(rawMessage.toString());
+
+      if (data.type === 'auth') {
+        const user = findUserByToken(db, data.token);
+        if (!user) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid token' }));
+          ws.close();
+          return;
+        }
+        authenticated = true;
+        userAuth = user;
+        ws.send(JSON.stringify({ type: 'auth_success', user: { name: user.name, role: user.role } }));
+        return;
+      }
+
+      if (!authenticated) {
+        ws.send(JSON.stringify({ type: 'error', message: 'not authenticated' }));
+        return;
+      }
+
+      if (data.type === 'chat_stream') {
+        const { messages = [], mode = 'chat' } = data;
+
+        if (!openai) {
+          ws.send(
+            JSON.stringify({
+              type: 'chunk',
+              content: 'Streaming requires OPENAI_API_KEY configuration.'
+            })
+          );
+          ws.send(JSON.stringify({ type: 'done' }));
+          return;
+        }
+
+        let systemPrompt = `You are an enterprise AI assistant for ${userAuth.orgName}.`;
+        let contextText = '';
+
+        if (mode === 'rag') {
+          const userLast = [...messages].reverse().find((m) => m.role === 'user');
+          const query = userLast?.content || '';
+          const contextChunks = await retrieveContextForOrg(userAuth.orgId, query, 4);
+          contextText = contextChunks
+            .map((c, i) => `[Doc ${i + 1} | ${c.source}]\n${c.text.slice(0, 700)}`)
+            .join('\n\n');
+          systemPrompt +=
+            ' Answer using the provided context first. If context is insufficient, explicitly say what is missing.';
+        }
+
+        const stream = await openai.chat.completions.create({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...(contextText ? [{ role: 'system', content: `Knowledge context:\n${contextText}` }] : []),
+            ...messages
+          ],
+          temperature: mode === 'rag' ? 0.2 : 0.3,
+          stream: true
+        });
+
+        let fullResponse = '';
+
+        for await (const chunk of stream) {
+          const content = chunk.choices?.[0]?.delta?.content || '';
+          if (content) {
+            fullResponse += content;
+            ws.send(JSON.stringify({ type: 'chunk', content }));
+          }
+        }
+
+        insertChatLog(db, {
+          orgId: userAuth.orgId,
+          userId: userAuth.id,
+          mode,
+          question: messages[messages.length - 1]?.content,
+          answer: fullResponse
+        });
+
+        ws.send(JSON.stringify({ type: 'done' }));
+      }
+    } catch (error) {
+      ws.send(JSON.stringify({ type: 'error', message: error.message }));
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+server.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
+  console.log('WebSocket endpoint: ws://localhost:' + port);
   console.log('Seed tokens: acme-admin-token, acme-user-token, acme-viewer-token');
 });
