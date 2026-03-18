@@ -2,7 +2,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
 import { createServer } from 'http';
-import multer from 'multer';
+// import multer from 'multer'; // Temporarily disabled due to Node.js v25 compatibility
 import OpenAI from 'openai';
 import { WebSocketServer } from 'ws';
 import { agentTools, executeToolCall } from './agents.js';
@@ -17,15 +17,20 @@ import {
 
 dotenv.config();
 
+console.log('[Init] Starting Enterprise AI Assistant...');
+
 const app = express();
 const port = process.env.PORT || 4000;
 const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const embeddingModel = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const apiKey = process.env.OPENAI_API_KEY;
 
+console.log('[Init] Creating database...');
 const db = createDatabase();
+console.log('[Init] Database ready');
 const openai = apiKey ? new OpenAI({ apiKey }) : null;
-const upload = multer({ storage: multer.memoryStorage() });
+// const upload = multer({ storage: multer.memoryStorage() }); // Temporarily disabled
+console.log('[Init] Middleware configured');
 
 app.use(cors());
 app.use(express.json());
@@ -195,7 +200,13 @@ app.get('/api/knowledge', authenticate, (req, res) => {
   res.json(summary);
 });
 
-app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), upload.single('document'), async (req, res) => {
+app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), async (req, res) => {
+  // Temporarily disabled file upload due to multer v25 compatibility
+  return res.status(503).json({ 
+    error: 'File upload temporarily disabled for maintenance',
+    message: 'Use /api/chat endpoints instead' 
+  });
+  /*
   const file = req.file;
   if (!file) {
     return res.status(400).json({ error: 'document file is required' });
@@ -241,6 +252,7 @@ app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), u
       details: error?.message || 'unknown error'
     });
   }
+  */
 });
 
 app.post('/api/chat', authenticate, async (req, res) => {
@@ -548,6 +560,8 @@ app.post('/api/chat/agent', authenticate, async (req, res) => {
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
+console.log('[Init] WebSocket configured');
+
 wss.on('connection', (ws) => {
   let authenticated = false;
   let userAuth = null;
@@ -644,7 +658,7 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
-  console.log('WebSocket endpoint: ws://localhost:' + port);
-  console.log('Seed tokens: acme-admin-token, acme-user-token, acme-viewer-token');
+  console.log(`[Ready] Server running on http://localhost:${port}`);
+  console.log('[Ready] WebSocket endpoint: ws://localhost:' + port);
+  console.log('[Ready] Seed tokens: acme-admin-token, acme-user-token, acme-viewer-token');
 });

@@ -6,77 +6,59 @@ const DEFAULT_DB_PATH = './data/enterprise_ai.db';
 
 export function createDatabase(dbPath = process.env.DB_PATH || DEFAULT_DB_PATH) {
   const resolved = path.resolve(process.cwd(), dbPath);
+  console.log('[DB] Creating database at:', resolved);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
 
+  console.log('[DB] Initializing DatabaseSync...');
   const db = new DatabaseSync(resolved);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS organizations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      slug TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
+  console.log('[DB] Database connection established');
+  
+  // Set PRAGMA individually
+  console.log('[DB] Setting WAL mode...');
+  db.exec('PRAGMA journal_mode = WAL');
+  console.log('[DB] WAL mode set');
+  
+  // Create tables individually to avoid execution issues
+  console.log('[DB] Creating organizations table...');
+  db.exec('CREATE TABLE IF NOT EXISTS organizations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+  
+  console.log('[DB] Creating users table...');
+  db.exec('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ("admin","user","viewer")), token TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(org_id) REFERENCES organizations(id))');
+  
+  console.log('[DB] Creating documents table...');
+  db.exec('CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, source TEXT NOT NULL, uploaded_by INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(org_id) REFERENCES organizations(id), FOREIGN KEY(uploaded_by) REFERENCES users(id))');
+  
+  console.log('[DB] Creating knowledge_chunks table...');
+  db.exec('CREATE TABLE IF NOT EXISTS knowledge_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, document_id INTEGER NOT NULL, text TEXT NOT NULL, embedding_json TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(org_id) REFERENCES organizations(id), FOREIGN KEY(document_id) REFERENCES documents(id))');
+  
+  console.log('[DB] Creating chat_logs table...');
+  db.exec('CREATE TABLE IF NOT EXISTS chat_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL, mode TEXT NOT NULL, question TEXT, answer TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(org_id) REFERENCES organizations(id), FOREIGN KEY(user_id) REFERENCES users(id))');
 
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      org_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('admin','user','viewer')),
-      token TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(org_id) REFERENCES organizations(id)
-    );
+  // Seed initial data
+  console.log('[DB] Checking for seed data...');
+  try {
+    const orgCount = db.prepare('SELECT COUNT(*) as count FROM organizations').get().count;
+    if (orgCount === 0) {
+      console.log('[DB] Seeding initial data...');
+      const insertOrg = db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)');
+      const orgResult = insertOrg.run('Acme Corp', 'acme');
 
-    CREATE TABLE IF NOT EXISTS documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      org_id INTEGER NOT NULL,
-      source TEXT NOT NULL,
-      uploaded_by INTEGER,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(org_id) REFERENCES organizations(id),
-      FOREIGN KEY(uploaded_by) REFERENCES users(id)
-    );
+      const insertUser = db.prepare(
+        'INSERT INTO users (org_id, name, email, role, token) VALUES (?, ?, ?, ?, ?)'
+      );
 
-    CREATE TABLE IF NOT EXISTS knowledge_chunks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      org_id INTEGER NOT NULL,
-      document_id INTEGER NOT NULL,
-      text TEXT NOT NULL,
-      embedding_json TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(org_id) REFERENCES organizations(id),
-      FOREIGN KEY(document_id) REFERENCES documents(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS chat_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      org_id INTEGER NOT NULL,
-      user_id INTEGER NOT NULL,
-      mode TEXT NOT NULL,
-      question TEXT,
-      answer TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(org_id) REFERENCES organizations(id),
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-  `);
-
-  const orgCount = db.prepare('SELECT COUNT(*) as count FROM organizations').get().count;
-  if (orgCount === 0) {
-    const insertOrg = db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)');
-    const orgResult = insertOrg.run('Acme Corp', 'acme');
-
-    const insertUser = db.prepare(
-      'INSERT INTO users (org_id, name, email, role, token) VALUES (?, ?, ?, ?, ?)'
-    );
-
-    insertUser.run(orgResult.lastInsertRowid, 'Acme Admin', 'admin@acme.example', 'admin', 'acme-admin-token');
-    insertUser.run(orgResult.lastInsertRowid, 'Acme Analyst', 'analyst@acme.example', 'user', 'acme-user-token');
-    insertUser.run(orgResult.lastInsertRowid, 'Acme Viewer', 'viewer@acme.example', 'viewer', 'acme-viewer-token');
+      insertUser.run(orgResult.lastInsertRowid, 'Acme Admin', 'admin@acme.example', 'admin', 'acme-admin-token');
+      insertUser.run(orgResult.lastInsertRowid, 'Acme Analyst', 'analyst@acme.example', 'user', 'acme-user-token');
+      insertUser.run(orgResult.lastInsertRowid, 'Acme Viewer', 'viewer@acme.example', 'viewer', 'acme-viewer-token');
+      console.log('[DB] Seed data created');
+    } else {
+      console.log('[DB] Seed data already exists, skipping');
+    }
+  } catch (error) {
+    console.error('[DB] Error seeding database:', error.message);
   }
 
+  console.log('[DB] Database initialization complete');
   return db;
 }
 
