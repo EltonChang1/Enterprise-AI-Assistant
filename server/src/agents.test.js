@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { safeEvaluateMathExpression } from './agents.js';
+import { executeToolCall, safeEvaluateMathExpression } from './agents.js';
 
 test('evaluates operator precedence and parentheses', () => {
   assert.equal(safeEvaluateMathExpression('2 + 2 * (3 - 1)'), 6);
@@ -32,4 +32,17 @@ test('throws on malformed number', () => {
 
 test('throws on empty expressions', () => {
   assert.throws(() => safeEvaluateMathExpression('   '), /empty expression/i);
+});
+
+test("executeToolCall('calculate') integrates parser and tool output", async () => {
+  const result = await executeToolCall(
+    'calculate',
+    { expression: '12 / 3 + 4 * (2 - 0.5)' },
+    { db: null, retrieveContextForOrg: async () => [], orgId: 1 }
+  );
+
+  assert.deepEqual(result, {
+    expression: '12 / 3 + 4 * (2 - 0.5)',
+    result: 10
+  });
 });
