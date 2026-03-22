@@ -2,7 +2,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
 import { createServer } from 'http';
-// import multer from 'multer'; // Temporarily disabled due to Node.js v25 compatibility
+import multer from 'multer';
 import OpenAI from 'openai';
 import { WebSocketServer } from 'ws';
 import { agentTools, executeToolCall } from './agents.js';
@@ -24,16 +24,126 @@ const port = process.env.PORT || 4000;
 const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const embeddingModel = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const apiKey = process.env.OPENAI_API_KEY;
+const jsonBodyLimit = process.env.MAX_JSON_BODY || '1mb';
+const uploadFileSizeBytes = Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024);
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const allowedUploadMimeTypes = new Set([
+  'text/plain',
+  'text/markdown',
+  'application/json',
+  'text/csv'
+]);
+const allowedMessageRoles = new Set(['system', 'user', 'assistant']);
 
 console.log('[Init] Creating database...');
 const db = createDatabase();
 console.log('[Init] Database ready');
 const openai = apiKey ? new OpenAI({ apiKey }) : null;
-// const upload = multer({ storage: multer.memoryStorage() }); // Temporarily disabled
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: uploadFileSizeBytes,
+    files: 1
+  },
+  fileFilter: (_req, file, cb) => {
+    if (allowedUploadMimeTypes.has(file.mimetype)) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('unsupported file type; use .txt, .md, .json, or .csv'));
+  }
+});
 console.log('[Init] Middleware configured');
 
-app.use(cors());
-app.use(express.json());
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        cb(null, true);
+        return;
+      }
+      cb(new Error('origin not allowed'));
+    }
+  })
+);
+app.use(express.json({ limit: jsonBodyLimit }));
+
+function createRateLimiter({ windowMs, maxRequests }) {
+  const hits = new Map();
+
+  return (req, res, next) => {
+    const key = extractToken(req) || req.ip || 'anonymous';
+    const now = Date.now();
+    const record = hits.get(key) || { count: 0, resetAt: now + windowMs };
+
+    if (now > record.resetAt) {
+      record.count = 0;
+      record.resetAt = now + windowMs;
+    }
+
+    record.count += 1;
+    hits.set(key, record);
+
+    if (record.count > maxRequests) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((record.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      return res.status(429).json({
+        error: 'rate limit exceeded',
+        retryAfterSeconds
+      });
+    }
+
+    return next();
+  };
+}
+
+function validateMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return 'messages array is required';
+  }
+
+  if (messages.length > 30) {
+    return 'messages array is too large (max 30)';
+  }
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') {
+      return 'each message must be an object';
+    }
+    if (!allowedMessageRoles.has(message.role)) {
+      return 'message role must be one of system, user, assistant';
+    }
+    if (typeof message.content !== 'string' || message.content.trim().length === 0) {
+      return 'message content must be a non-empty string';
+    }
+    if (message.content.length > 8000) {
+      return 'message content exceeds max length (8000 characters)';
+    }
+  }
+
+  return null;
+}
+
+function parseTopK(topKValue, fallback = 4) {
+  const parsed = Number(topKValue);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(8, Math.max(1, Math.floor(parsed)));
+}
+
+const apiRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: Number(process.env.API_RATE_LIMIT_PER_MINUTE || 120)
+});
+const chatRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: Number(process.env.CHAT_RATE_LIMIT_PER_MINUTE || 30)
+});
+
+app.use('/api', apiRateLimiter);
+app.use('/api/chat', chatRateLimiter);
 
 function normalizeText(text) {
   return (text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
@@ -200,13 +310,7 @@ app.get('/api/knowledge', authenticate, (req, res) => {
   res.json(summary);
 });
 
-app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), async (req, res) => {
-  // Temporarily disabled file upload due to multer v25 compatibility
-  return res.status(503).json({ 
-    error: 'File upload temporarily disabled for maintenance',
-    message: 'Use /api/chat endpoints instead' 
-  });
-  /*
+app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), upload.single('document'), async (req, res) => {
   const file = req.file;
   if (!file) {
     return res.status(400).json({ error: 'document file is required' });
@@ -252,15 +356,12 @@ app.post('/api/knowledge/upload', authenticate, requireRoles('admin', 'user'), a
       details: error?.message || 'unknown error'
     });
   }
-  */
 });
 
 app.post('/api/chat', authenticate, async (req, res) => {
   const { messages = [] } = req.body;
-
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: 'messages array is required' });
-  }
+  const validationError = validateMessages(messages);
+  if (validationError) return res.status(400).json({ error: validationError });
 
   const userLast = [...messages].reverse().find((m) => m.role === 'user');
 
@@ -323,11 +424,10 @@ app.post('/api/chat', authenticate, async (req, res) => {
 });
 
 app.post('/api/chat/rag', authenticate, async (req, res) => {
-  const { messages = [], topK = 4 } = req.body;
-
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: 'messages array is required' });
-  }
+  const { messages = [] } = req.body;
+  const topK = parseTopK(req.body?.topK, 4);
+  const validationError = validateMessages(messages);
+  if (validationError) return res.status(400).json({ error: validationError });
 
   const userLast = [...messages].reverse().find((m) => m.role === 'user');
   const query = userLast?.content || '';
@@ -445,10 +545,8 @@ app.get('/api/analytics/overview', authenticate, requireRoles('admin'), (req, re
 // Agent chat with tool calling
 app.post('/api/chat/agent', authenticate, async (req, res) => {
   const { messages = [] } = req.body;
-
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: 'messages array is required' });
-  }
+  const validationError = validateMessages(messages);
+  if (validationError) return res.status(400).json({ error: validationError });
 
   const userLast = [...messages].reverse().find((m) => m.role === 'user');
 
@@ -590,6 +688,15 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'chat_stream') {
         const { messages = [], mode = 'chat' } = data;
+        const validationError = validateMessages(messages);
+        if (validationError) {
+          ws.send(JSON.stringify({ type: 'error', message: validationError }));
+          return;
+        }
+        if (!['chat', 'rag'].includes(mode)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'invalid stream mode' }));
+          return;
+        }
 
         if (!openai) {
           ws.send(
@@ -655,6 +762,30 @@ wss.on('connection', (ws) => {
   ws.on('error', (error) => {
     console.error('WebSocket error:', error);
   });
+});
+
+app.use((error, _req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: `file exceeds ${uploadFileSizeBytes} byte limit`
+      });
+    }
+    return res.status(400).json({ error: error.message });
+  }
+
+  if (error?.message === 'origin not allowed') {
+    return res.status(403).json({ error: 'origin not allowed' });
+  }
+
+  if (error) {
+    return res.status(500).json({
+      error: 'internal server error',
+      details: error.message
+    });
+  }
+
+  return next();
 });
 
 server.listen(port, () => {

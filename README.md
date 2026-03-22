@@ -42,10 +42,22 @@ npm --prefix web install
 
 ```bash
 cp server/.env.example server/.env
+cp web/.env.example web/.env
 ```
 
 Then add `OPENAI_API_KEY` in `server/.env` if you want real model responses.
 `DB_PATH` defaults to `./data/enterprise_ai.db` and stores persistent tenant data.
+
+Server hardening options in `server/.env`:
+- `MAX_JSON_BODY` (default `1mb`)
+- `MAX_UPLOAD_BYTES` (default `2097152`)
+- `API_RATE_LIMIT_PER_MINUTE` (default `120`)
+- `CHAT_RATE_LIMIT_PER_MINUTE` (default `30`)
+- `ALLOWED_ORIGINS` (comma-separated list, defaults to allow all when empty)
+
+Frontend endpoint options in `web/.env`:
+- `VITE_API_BASE_URL` (default `http://localhost:4000`)
+- `VITE_WS_BASE_URL` (default derived from `VITE_API_BASE_URL`)
 
 3. Start backend
 

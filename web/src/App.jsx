@@ -1,7 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-const API_BASE = 'http://localhost:4000';
-const WS_BASE = 'ws://localhost:4000';
+function toWebSocketUrl(httpUrl) {
+  if (httpUrl.startsWith('https://')) {
+    return `wss://${httpUrl.slice('https://'.length)}`;
+  }
+  if (httpUrl.startsWith('http://')) {
+    return `ws://${httpUrl.slice('http://'.length)}`;
+  }
+  return httpUrl;
+}
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
+const WS_BASE = import.meta.env.VITE_WS_BASE_URL || toWebSocketUrl(API_BASE);
 
 export default function App() {
   const [messages, setMessages] = useState([

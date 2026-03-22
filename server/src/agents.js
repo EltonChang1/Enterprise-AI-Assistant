@@ -59,6 +59,187 @@ export const agentTools = [
   }
 ];
 
+function tokenizeMathExpression(expression) {
+  const source = String(expression || '').trim();
+  if (!source) {
+    throw new Error('empty expression');
+  }
+
+  const tokens = [];
+  let index = 0;
+
+  while (index < source.length) {
+    const char = source[index];
+
+    if (/\s/.test(char)) {
+      index += 1;
+      continue;
+    }
+
+    if (/[0-9.]/.test(char)) {
+      let end = index + 1;
+      while (end < source.length && /[0-9.]/.test(source[end])) end += 1;
+      const rawNumber = source.slice(index, end);
+      if (!/^\d*\.?\d+$/.test(rawNumber)) {
+        throw new Error('invalid number format');
+      }
+      tokens.push({ type: 'number', value: Number(rawNumber) });
+      index = end;
+      continue;
+    }
+
+    if ('+-*/()'.includes(char)) {
+      if (char === '(' || char === ')') {
+        tokens.push({ type: 'paren', value: char });
+      } else {
+        tokens.push({ type: 'operator', value: char });
+      }
+      index += 1;
+      continue;
+    }
+
+    throw new Error('unsupported character in expression');
+  }
+
+  return tokens;
+}
+
+function toRpn(tokens) {
+  const output = [];
+  const operators = [];
+  const precedence = { '+': 1, '-': 1, '*': 2, '/': 2, 'u-': 3 };
+  const associativity = { '+': 'left', '-': 'left', '*': 'left', '/': 'left', 'u-': 'right' };
+
+  let previous = null;
+
+  for (const token of tokens) {
+    if (token.type === 'number') {
+      output.push(token);
+      previous = token;
+      continue;
+    }
+
+    if (token.type === 'operator') {
+      let op = token.value;
+      const isUnaryMinus =
+        op === '-' &&
+        (!previous || previous.type === 'operator' || (previous.type === 'paren' && previous.value === '('));
+
+      if (isUnaryMinus) {
+        op = 'u-';
+      }
+
+      while (operators.length > 0) {
+        const top = operators[operators.length - 1];
+        if (top.type !== 'operator') break;
+
+        const topPrec = precedence[top.value];
+        const curPrec = precedence[op];
+        const isLeftAssoc = associativity[op] === 'left';
+
+        if (topPrec > curPrec || (topPrec === curPrec && isLeftAssoc)) {
+          output.push(operators.pop());
+        } else {
+          break;
+        }
+      }
+
+      operators.push({ type: 'operator', value: op });
+      previous = { type: 'operator', value: op };
+      continue;
+    }
+
+    if (token.type === 'paren' && token.value === '(') {
+      operators.push(token);
+      previous = token;
+      continue;
+    }
+
+    if (token.type === 'paren' && token.value === ')') {
+      let foundOpening = false;
+      while (operators.length > 0) {
+        const top = operators.pop();
+        if (top.type === 'paren' && top.value === '(') {
+          foundOpening = true;
+          break;
+        }
+        output.push(top);
+      }
+
+      if (!foundOpening) {
+        throw new Error('mismatched parentheses');
+      }
+
+      previous = token;
+    }
+  }
+
+  while (operators.length > 0) {
+    const op = operators.pop();
+    if (op.type === 'paren') {
+      throw new Error('mismatched parentheses');
+    }
+    output.push(op);
+  }
+
+  return output;
+}
+
+function evaluateRpn(rpnTokens) {
+  const stack = [];
+
+  for (const token of rpnTokens) {
+    if (token.type === 'number') {
+      stack.push(token.value);
+      continue;
+    }
+
+    if (token.type !== 'operator') {
+      throw new Error('invalid token in expression');
+    }
+
+    if (token.value === 'u-') {
+      if (stack.length < 1) throw new Error('invalid unary operation');
+      stack.push(-stack.pop());
+      continue;
+    }
+
+    if (stack.length < 2) throw new Error('invalid binary operation');
+    const right = stack.pop();
+    const left = stack.pop();
+
+    switch (token.value) {
+      case '+':
+        stack.push(left + right);
+        break;
+      case '-':
+        stack.push(left - right);
+        break;
+      case '*':
+        stack.push(left * right);
+        break;
+      case '/':
+        if (right === 0) throw new Error('division by zero');
+        stack.push(left / right);
+        break;
+      default:
+        throw new Error('unknown operator');
+    }
+  }
+
+  if (stack.length !== 1 || !Number.isFinite(stack[0])) {
+    throw new Error('invalid expression result');
+  }
+
+  return stack[0];
+}
+
+export function safeEvaluateMathExpression(expression) {
+  const tokens = tokenizeMathExpression(expression);
+  const rpn = toRpn(tokens);
+  return evaluateRpn(rpn);
+}
+
 export async function executeToolCall(toolName, args, context) {
   const { db, retrieveContextForOrg, orgId } = context;
 
@@ -97,9 +278,7 @@ export async function executeToolCall(toolName, args, context) {
     case 'calculate': {
       const { expression } = args;
       try {
-        // Safe evaluation limited to basic math
-        const sanitized = expression.replace(/[^0-9+\-*/().\s]/g, '');
-        const result = Function(`'use strict'; return (${sanitized})`)();
+        const result = safeEvaluateMathExpression(expression);
         return {
           expression,
           result: Number(result)
